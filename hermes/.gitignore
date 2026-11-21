@@ -1,0 +1,24 @@
+# Local deployment and private data are never part of the portable skill.
+.env
+.env.*
+*.local
+*.log
+*.sqlite*
+*.db
+*.bak
+*.lock
+/data/
+/state/
+/logs/
+/cron/
+/sessions/
+/private/
+/cache/
+**/state.json
+**/jobs.json
+**/review-cache/
+**/inbox-cache/
+**/__pycache__/
+**/.pytest_cache/
+**/cookies*.json
+**/storageState*.json

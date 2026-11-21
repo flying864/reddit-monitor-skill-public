@@ -1,0 +1,30 @@
+{
+  "media": [
+    {
+      "href": "https://old.reddit.com/domain/i.redd.it/"
+    },
+    {
+      "src": "https://preview.redd.it/fixture.png?width=108"
+    },
+    {
+      "href": "https://i.redd.it/fixture.png"
+    },
+    {
+      "url": "https://old.reddit.com/gallery/testgallery"
+    },
+    {
+      "url": "https://example.invalid/?href=i.redd.it"
+    }
+  ],
+  "feed": [
+    {
+      "crosspostFullname": "t3_testparent",
+      "permalink": "/r/fixturetools/comments/testparent/parent/"
+    },
+    {
+      "crosspostFullname": "t3_testchild",
+      "targetParentFullname": "t3_testparent",
+      "permalink": "/r/fixturetools/comments/testchild/child/"
+    }
+  ]
+}
