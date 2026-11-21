@@ -1,24 +1,18 @@
-# Local deployment and private data are never part of the portable skill.
+# Python bytecode & caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Local environment & secrets
 .env
 .env.*
-*.local
-*.log
-*.sqlite*
-*.db
-*.bak
-*.lock
-/data/
-/state/
-/logs/
-/cron/
-/sessions/
-/private/
-/cache/
-**/state.json
-**/jobs.json
-**/review-cache/
-**/inbox-cache/
-**/__pycache__/
-**/.pytest_cache/
-**/cookies*.json
-**/storageState*.json
+
+# Runtime state, locks & isolated test fixtures
+state.json
+run.lock
+review-cache/
+inbox-cache/
+archive-journal/
+.persist-fixture-*/
+skills/**/.persist-fixture-*/

@@ -1,33 +1,57 @@
-# 当前监控与输出契约
+# 内容监控计数与输出契约
 
-执行以[主 Skill](../SKILL.md)、部署环境的适用上级规则及本轮授权为准，不增加扫描范围、频率或调用预算，不修改线上 Cron。
+## 1. 最小证据与执行/覆盖分离
 
-## 最小证据
-每轮记录 run_id、带时区的 started_at/finished_at、请求来源清单、成功/失败来源、各来源的分页范围/停止原因、实际读取来源和 source_checked_at。缓存还需 generated_at/age、降级原因；不能刷新时间冒充重新扫描。只有成功读取并验证的来源才计入扫描成功数。
+每轮监控必须如实记录 `contentRunId`、带时区的 `startedAt` / `finishedAt`、请求 Watch 数、成功/失败来源、分页上限与上下文缺失原因。
 
-扫描开始前从已授权任务/Watch 配置取得时间窗和范围；不得猜成“全部 Reddit”。分页上限、预算截止、load more、折叠评论、图片/正文不可读须分别记录缺失范围。内容监控只审核不草拟；手动草稿任务才在起草前读取精确线程。缺失信息是否决定当前判断应逐条说明；关键证据缺失时待复核，不把无关配图失败一律当作审核失败。分别标注评论计数覆盖、正文可用性、媒体是否看过、楼层关系及证据时点；删除占位、仅图片链接和实际截断不是已读正文。当前正文缺失时，回填的旧正文须标为历史证据，不当作本轮重新核实。
+| 字段 | 枚举 / 类型 | 严格语义 |
+| :--- | :--- | :--- |
+| `executionStatus` | `success` / `partial` / `failed` | `success`：所有 Watch 列表及选中线程均成功读取；`partial`：列表或线程部分成功部分失败（某 Watch 合法为空、另一 Watch 失败计为 `partial`）；`failed`：所有列表失败，或本轮所有尝试读取的正文全部失败。 |
+| `coverageComplete` | `boolean` | 仅当目标时间窗、分页边界与全部评论上下文均完整无截断时为 `true`。默认仅抓首页前 25 条时必须为 `false`，即使 `executionStatus="success"` 也须明确说明“仅覆盖首页前 25 条”。 |
+| `discussion_status` | `zero_comments` / `has_comments` / `unknown` | 评论数缺失、非整数或存在未验证截断时必须记为 `unknown`（JSON 计数用 `null`），严禁用 `0` 伪装。 |
 
-## 结果语义：执行与覆盖分开
-- executionStatus=success：约定列表和本轮选中线程的读取均成功；不表示已覆盖整个时间窗。
-- executionStatus=partial：列表来源或已选线程有成功也有失败；说明受影响对象。
-- executionStatus=failed：没有有效扫描证据；解析异常不当作合法空列表。
-- coverageComplete：只在可证明目标时间窗、分页边界及所需上下文完整时为 true；第一页上限、预算延期、折叠评论等单列原因。例如仅扫描第一页时，不能据此声称整个配置时间窗都已覆盖，即使 executionStatus=success 也报告覆盖不完整。
-- 未知评论数/未读数使用 null + unverified，不使用 0 或 -1 伪装真实计数。
-- 新发现线索、成功入选新候选、旧帖重审、预算延期、推荐/跳过/信息不足/审核失败分别统计；关键词命中与笼统求助探查分开，均不等于可回复。计数相互核对，不用全部 candidates 数代表新候选。
+---
 
-## 零回复优先与计数口径
-- 发现阶段关键词与笼统求助线索统一分层：零评论整体优先，非零与未知随后；最多一个泛求助探查位仅在同一评论层内保留，不得跨层挤占零回复。保持原每轮预算、分页及时间窗。语义阶段按“零回复可靠帮助 / 有评论但未获有效回答 / 重要纠错或关键缺口例外”推荐；已充分回答、重复建议、泛泛职业讨论跳过，证据不足的真实求助待复核。
-- `scan.newLeadDiscussionCounts` / `newSelectedDiscussionCounts` / `newDeferredDiscussionCounts` 分别是列表时已去重的发现线索、选中读取、预算延期，均含 zero_comments/has_comments/unknown。线索符合发现条件但尚不保证内容相关，不能声称全Feed零回复总数。
-- `newCandidateDiscussionCounts` / `retryCandidateDiscussionCounts` 是正文读取后的候选分组，不能与列表时口径混用。`newPrefilterSkippedDiscussionCounts` 为正文时初筛不相关；`newContextFailureListingCounts` 为列表时选中但正文失败；`newListingZeroChangedAtContextCount` 为列表0、正文已有评论。候选保留 `num_comments_at_listing` 和 `listing_discussion_status` 便于复核。
-- 审核落库后，使用获批运行时采集器的 `summary` 子命令（运行时位于仓库 `hermes/runtime/`，入口以获批配置为准），只读当前 state/cache，在共享锁内核对 contentRunId，再返回 `outcomesByOriginAndContextDiscussion`。new/retry 各组内用正文时评论状态区分 candidates/reviewed/recommended/not_recommended/needs_manual_review/failed_agent/pending。仅本轮精确目标的 lastReviewRunId + lastReviewPayload 计入结果；failed_agent 不算完成审核，pending 不算跳过。旧缓存缺新扫描计数字段时写未提供，不凭其他计数补0。候选缺 candidate_origin、discussion_status 或 permalink，以及目标重复时，summary 必须拒绝汇总并非零退出，不能静默跳过后输出全0；只有候选列表确实存在且为空时才返回已验证0。
-- 将评论状态与推荐类别作为两个维度：零回复只是讨论状态，主机会还须是真实求助且能提供可靠帮助。无评论的科普/经验帖若含有经原文与可靠来源核实的重要安全误导，也只能列为纠错例外，不能算求助主机会；不能仅因一句话看起来可反驳就扩大监控范围。
-- 每轮突出零回复发现、审核、推荐和跳过原因；将有评论但未获帮助与重要纠错例外分开。旧项不得冒充新发现，没有合适项不凑数。
-- 预算外条目若只有计数、没有可接续队列，报「本轮未读、未排队」，不要承诺下轮补审。隔离测试让本轮落选条目在下轮滑出首页；只有能独立取回最小待审标识并继续按授权预算、去重和有效期处理，才算已入队。
-- 对正文才识别出的原帖／转帖关系记录显式去重结果；不要让「选中但未形成候选」默认写为正文失败或消耗重试次数。用两篇正文均成功、实际同一原帖的夹具核对：一条候选、一条去重、零条正文失败。
+## 2. 零回复优先选帖与双阶段计数口径
 
-## 简洁回执
-按任务分支选择，不能拼成全功能必做清单：
-- 内容监控：run_id／时间窗 → 采集执行与覆盖范围 → 新候选／旧帖重审／延期 → 新候选审核分类及关键链接 → 采集／审核持久化 → 未验证项与缓存年龄 → 已检查、未起草、未发布。Inbox 不在本任务中检查；不展示草稿或要求 Draft 持久化。
-- Inbox：授权通道各自状态 → 需处理／已处理／跳过／延期 → 在本任务明确授权内实际执行的动作及回读 → Inbox 持久化与未验证项。不要求扫描内容 Feed。
-- 手动草稿／发布：按本轮交付物给英文草稿＋中文说明，或发布后的精确验证回执；不自动增加监控范围。
-将读取、状态写入、归档和通知投递分别记录。Inbox 所有必需来源均未验证时，不能按空收件箱成功结束；有有效来源时说明部分完成和具体缺失，并核对实际调度契约能否把业务失败写入账本。投递失败只补发已经生成的同一简报，不重跑可能回复的任务。内部测试结果只证明对应场景，不代替真实 Cron 结果；代码审阅任务交付审阅结果即可。
+### 列表发现阶段（Listing-Time）
+- 将关键词命中（`keyword`）与笼统求助线索（`generic_help`，如求助标题或 Help/Question Flair）合并排序：**`zero_comments` 层全局优先于非零/未知层**。
+- 泛求助探查名额（最多 1 个保留位）仅在当前轮到的同一评论层内生效，绝不允许有回复的泛求助帖跨层挤占零回复帖预算。
+- 自定义 Feed（`/user/<u_name>/m/<feed>/new/`）必须固定 `/new/` 排序，每轮实时从 `.side ul.subreddits > li > a` 提取成员社区集并校验帖子归属；成员列表为空或排序不符立即失败退出，拒绝沿用过期范围。
+- 列表阶段统计字段：
+  - `scan.newLeadDiscussionCounts`：去重后新发现线索
+  - `scan.newSelectedDiscussionCounts`：预算内选中读取正文的线索
+  - `scan.newDeferredDiscussionCounts`：超出每轮 `maxCandidates` 预算未读取的线索（报“本轮未读”，不承诺下轮必然在首页）
+
+### 正文读取与候选阶段（Context-Time）
+正文读取后重新按标题＋正文计算关键词与相关性（支持 `watch.domainTerms` 自定义领域词），严格对账：
+$$\text{newSelected} = \text{newCandidates} + \text{newPrefilterSkipped} + \text{newContextDedup} + \text{newContextFailures}$$
+
+- `newCandidateDiscussionCounts` / `retryCandidateDiscussionCounts`：入选待语义复核的新候选与旧帖重试候选
+- `newPrefilterSkippedDiscussionCounts`：正文初筛确认买卖/估价/展示/无关（`skipped_low_fit`）
+- `newContextDedupDiscussionCounts`：正文阶段才暴露跨帖/同源关系而显式去重（`skipped_duplicate_thread`，**不计入正文失败，不消耗 `retryCount`**）
+- `newContextFailureListingCounts`：正文读取异常（`skipped_context_unverified`，保留后续有界重试资格）
+- `newListingZeroChangedAtContextCount`：列表时为 0 评论、读取正文时已出现评论的帖子数
+
+---
+
+## 3. 语义复核与 `summary` 对账
+
+1. 候选语义复核逐条通过 `python3 hermes/runtime/reddit_monitor_tick_noagent.py review --result-file <path>` 落库。
+2. 全部复核完成后，调用 `python3 hermes/runtime/reddit_monitor_tick_noagent.py summary` 在共享锁内只读输出 `outcomesByOriginAndContextDiscussion`：
+   - 自动校验 `state.contentRunId == cache.contentRunId`；
+   - 自动将 `scan.newCandidateCount` / `scan.retryCandidateCount` 及分组计数与 `cache.candidates` 逐项对账，防止候选被删改后静默汇总；
+   - 自动校验每条已审记录的 `lastReviewCandidateHash`（SHA-256）与 `lastReviewSnapshot`，发现证据或状态篡改立即非零退出。
+
+---
+
+## 4. 分支回执输出模板
+
+- **内容监控回执**：
+  1. 首行结论：明确区分**实质零回复/未解决求助推荐数**与**安全纠错例外数**，提示是否需要用户进一步决策；
+  2. 扫描元数据：`contentRunId`、起止时间与时区、Watch 来源、执行状态与覆盖范围限制；
+  3. 队列分流计数：新发现候选 / 旧帖重试 / 预算延期 / 人工待办（`manual_pending`）；
+  4. 候选复核明细：推荐、跳过、信息不足待复核（`needs_manual_review`）、复核失败及关键 Permalink 证据；
+  5. 持久化校验状态与固定尾部声明：`已检查｜未起草｜未发布`（不含回复草稿与 Inbox 清单）。
+- **Inbox 分流回执**：仅报告授权通道验证状态、`actionable / handled / noise / deferred` 计数、本轮授权内实际动作及持久化校验结果；未验证通道明确标注“未验证”，不报 `0`。
+- **手动草稿 / 发布回执**：草稿模式输出英文定稿＋中文说明；发布模式输出精确评论链接、提交英文原文、中文大意及五要素回读核验结果。

@@ -1,41 +1,70 @@
-# 当前状态与隔离模板契约
+# 状态持久化、防重与归档契约
 
-## 验收方式
-对模板执行隔离 unittest，不访问 Reddit 或真实监控目录。覆盖缺配置、不完整候选、未知 Inbox、已发布保护、批次重试、锁竞争、单文件替换失败及跨文件中断；测试通过仅证明给定输入和故障注入。接口以脚本 argparse / persist_tick 签名及同批测试夹具为准，不复制过期参数。
+## 1. 运行数据目录与文件职责
 
-## 跨轮防重与中断回放
+所有生产运行状态必须存放在代码仓库外的独立目录（由环境变量 `REDDIT_MONITOR_DIR` 指定），共享同一把非阻塞文件锁 `<REDDIT_MONITOR_DIR>/run.lock`（通过 `file_lock.py` 兼容 POSIX `fcntl` 与 Windows `msvcrt`）。
 
-以下是发送或存储改造的验收条件，不是现役代码已经提供的保证。只在临时目录用合成载荷运行当前脚本的本地 CLI（以 `--help` 核对覆盖路径），或调用现役模块并替换浏览器提交为计数桩；不复制私聊正文，不触发真实 Cron。
+| 任务域 | 批次键 | 所属文件集合 | 隔离约束 |
+| :--- | :--- | :--- | :--- |
+| **内容监控与复核** | `contentRunId` | `state.json`（顶层 `contentRunId`、`seen.byPermalink`）↔ `review-cache/latest.json` | 绝不修改 `state.json.inbox` |
+| **Inbox 分流** | `inboxRunId` | `state.json.inbox` ↔ `inbox-cache/latest.json` ↔ `inbox-cache/deferred.json` | 绝不修改 `contentRunId` 与 `seen` |
+| **显式归档审计** | 继承当前 `contentRunId` | `archive-journal/<journalId>/{state.before.json, cache.before.json, journal.json}` | 仅追加 `entry.archive` 标记并清理对应 `manual_pending` |
 
-1. 稳定入站 ID 是业务主键，URL 写法仅作别名。用同一个入站目标的两个 URL 写法做延期、结案和已处理保护对账；不要用外发 Comment ID 代替入站目标。用三来源均未验证、却携带同目标多份已发证据的载荷验证拒绝，不把格式正确当作真实发布证明。
-2. 用 `A → B → A` 而不只用 `A → A` 验证批次幂等：旧批不能回拨水位；同一个历史批次 ID 不可换载荷覆盖真实回复回执。只比较最近一份结果发现不了跨批重放。
-3. 两个执行者核对同一目标，断开点分别设在提交前、提交结果未知、远端已成功但本地回执未写。验收须证明唯一提交与未知结果跨轮持久化；结果不明只关联远端回读或转人工，不因待确认记录到期就再次提交。浏览器与本地状态没有同一事务，不能承诺必然恰好一次。
-4. 在每个文件写入边界模拟中断，并模拟批次号不变但内容已变。正常读者应只看到上一完整结果，或明确拒绝；若支持恢复，从可信回执或提交日志续办并核对最终状态，不用旧整库覆盖新业务。单次手工入账的日志必须区分已准备、已提交和待核对；`prepared` 本身既不证明未发，也不证明已保存。
+> **跨任务独立性**：`contentRunId` 与 `inboxRunId` 各自独立推进，不要求相等；每个工具仅校验自身所属文件集合的同名批次键一致性。
 
-## 线上协议与隔离模板分开
-线上内容脚本使用 contentRunId，Inbox辅助脚本使用 inboxRunId，均持生产 run.lock，禁止互相覆盖各自结果。候选采集不等于审核完成；语义结论通过内容脚本 review 子命令锁内落库。内容不修改 inbox.lastResults。多个文件只有单文件原子替换，单边批次或不一致应拒绝，不能自动合并掩盖中断。上线验收必须包含连续两轮、丢失一侧批次、锁竞争不清页面，以及review命令不二次获取自身锁；仅测试函数不证明CLI可用。
+---
 
-## 范围
-附带的[持久化模板](../scripts/scheduled_tick_persist_template.py) 是隔离持久化模板，不属于生产运行时。默认不配置数据即失败，不能把其测试输出当真实监控回执。模板拒绝生产路径，仅允许本 Skill 下独立 `.persist-fixture-*` 目录中的合成数据文件。其 CLI 同时要求 scan、candidates（若非空则须含已验证草稿）和三个 Inbox 夹具通道；这是模板接口，不是内容／Inbox 运行时的任务边界。模板加锁不保护不合作写入者；生产实现须单独审查，不得把模板改接生产。
+## 2. 双阶段原子写入与中断保护
 
-## 状态与输入
-明确传入本轮授权分支的实际来源、成功/失败/覆盖和时间。内容监控无需检查或填充 Inbox 通道结果；Inbox 任务才分别记录 old unread / notifications / chat 状态。未知 unread_count 为 null，不能更新成已验证0。未配置、缺必需候选字段或无有效扫描证据不得覆盖旧数据。未完整上下文不得默认 drafted；仅真实草稿任务需英文/中文及版本、来源、验证标记。
-posted/handled/posted_manual 等已处理状态不可被普通草稿或候选审核降级；新追问按 comment ID 独立记录。内容审核以 contentRunId + 精确 permalink + 完整结果载荷核验同批幂等；Inbox 以 inboxRunId + 完整载荷核验批次并按 Comment ID / Parent 去重；实际草稿另含版本，同批重试不增草稿数。同批次不同载荷必须拒绝，不能拿历史草稿契约代替无草稿内容审核。同批同载荷重放同时核对当前结果字段和对应缓存候选证据完整性，输入相同不等于输出未漂移；分别测试正常重放、状态字段漂移和缓存候选漂移。只共享已发布/已处理保护集合，不直接复用包含 recommended/not_recommended 的发现终态集合，否则会拒绝正常重放。
+多次单文件 `os.replace` 不构成跨文件数据库事务，因此必须遵守以下写入顺序：
+1. 持非阻塞独占锁完整读取最新 JSON（禁止基于截断或分页片段覆盖）；
+2. 写入第一份文件（如 `review-cache/latest.json`），立即完整回读并逐字段校验一致后，**才允许**推进 `state.json` 的批次键并执行原子替换；
+3. 若任一侧批次键缺失或不一致（`check_run_pair` / `inboxRunId` 校验失败），立即拒绝读写并报告中断，严禁静默合并掩盖不一致。
 
-## 显式归档生命周期
+---
 
-用户批准归档的精确帖子以 `entry.archive.status=archived` 记录为生命周期终态，保留原 action/reviewStatus、审核理由、计数和去重记录，不冒充问题已解决。归档条目不得进入新发现、旧帖重审、人工待办提醒或普通 review 写入；安全风险标签也不能自动重开。只有用户明确指定重开才另行处理。直接回复/私信仍由独立Inbox按原授权处理，不将其混成内容任务重开。
+## 3. 幂等重放、防回拨与终态保护
 
-归档前固定精确链接清单与当前条目指纹，持共享锁完整读取state/cache，拒绝批次改变、记录漂移、当前候选或已发布保护目标。state仅新增归档标记，cache只移除对应manual_pending行；保留当前候选、scan、Inbox、Watch及批次。保存不可变备份和写前journal，双文件原子替换并逐字段回读。不能把一次批准扩为未来所有帖子自动归档，也不整体恢复旧state覆盖后续业务更新。
+1. **终态硬保护**：
+   - 内容侧：`posted`、`posted_manual`、`posted_reply`、`handled`、`already_replied`（无论位于顶层还是 `meta`）不可被扫描、草稿或 `review` 覆盖；
+   - Inbox 侧：以**稳定入站 ID**（`parentCommentId` / `messageId` / `chatMessageId` / 入站 `commentId`）为主键，URL 仅作归一化别名。同一入站目标即使更换 URL slug 提交 `no_reply` 或 `already_replied`，也不得覆盖或重复创建已有的 `posted_reply` 记录。
+2. **内容复核指纹校验（`review` & `summary`）**：
+   - `review` 写入 `lastReviewIntegrityVersion=1`、`lastReviewCandidateHash`（候选稳定序列化 SHA-256）及 `lastReviewSnapshot`；
+   - 同批次同载荷重放若状态字段或缓存候选证据发生任何漂移，立即抛出异常拒绝；同批次不同载荷直接拒绝。
+3. **Inbox 跨批防回拨（`A → B → A` 防护）**：
+   - `state.json.inbox._runHistory` 记录历史批次摘要：当新批次 `B` 已推进水位后，重放旧批次 `A` 会被明确拒绝（`stale inbox batch replay rejected`），防止水位回拨；
+   - `postedReplies` 要求对应来源通道状态必须为 `verified`，且单批内禁止同一入站目标重复登记多条回复证据。
 
-## 写入与读回
-在共同锁/版本协议内完整读取最新 state/cache；只拿到截断文件不写。保留不属于本轮的字段和已处理记录，定义本轮拥有的扫描/候选/Inbox快照字段，不能用“读过旧文件”代替字段保留。
-采用同目录唯一临时文件、fsync、原子单文件替换。运行时文件映射（相对于另行配置的运行数据根目录，不是模板路径）：
-- 内容批次：`state.json` 顶层 `contentRunId` ↔ `review-cache/latest.json.contentRunId`。内容审核结果只在对应批次候选内，经 review 子命令写 state 的对应条目，不改 Inbox 结果。
-- Inbox 批次：`state.json.inbox.inboxRunId` ↔ `inbox-cache/latest.json.inboxRunId` ↔ Inbox deferred 文件的 `inboxRunId`（文件路径以当前辅助脚本 `DEFERRED_PATH` 为准）。该任务新输入的 `runId` 与 `inboxRunId` 须相等。
-- 手动发布真实回读成功后，先保存含精确正文、账号、Comment ID、Parent、Permalink 和验证时间的独立回执，再持共享锁完整读 state/cache。当前 contentRunId 匹配时，只将精确目标记为 posted_manual/posted，并在对应缓存候选标注 postingStatus、评论链接及 manualActions；保留原始扫描计数、lastReviewPayload 与历史候选，不删除候选来改变已完成批次的统计。其他线程、Inbox和Watch字段不动。批次已变时不套用旧缓存覆盖，保留外部发布回执并明确局部落库限制。
-- 两类任务独立，`contentRunId` 不必等于 `inboxRunId`；共享锁保护同一个 state 文件，不意味共享批次。仅校验当前任务所属文件集合的同名批次键。
-多次 rename 不构成跨文件事务；任一所属文件缺批次或批次不一致时拒绝当成完整结果，报告需恢复，不自动覆盖掩盖中断。写前一份文件并回读后，先通过约定校验才推进后一份的批次；仅在两份都写完后返回非零，会让同批次的错误数据看起来已提交。`summary` 除校验同批次和候选身份外，还应按 new/retry 将扫描候选数与实际缓存候选逐组对账，不一致时拒绝正常汇总。隔离测试保留批次键，分别删除一条候选和仅变更已审核候选的评论证据。验证写入端停止推进，以及 `summary` 用与 `review` 重放相同的证据指纹和状态快照拒绝正常汇总；候选数和结果枚举都对上仍不能证明审核依据未变。恢复生产状态需要对应授权。隔离模板的通用 run_id 不能代替上述生产键名。
-字段级回读比较完整预期内容，不能只验证 permalink 存在。缓存证据完整性可保存稳定序列化后的SHA256及版本，不在state重复复制整份评论/媒体载荷；新记录有完整性版本时不得因指纹字段缺失而降级为旧记录。旧记录未保存指纹时，不冒充可追溯证明旧候选从未变化。Scan、Draft、Cache Persistence、State Persistence 分开报告；任一必需检查失败返回非零，包括校验返回false。Python未捕获异常本来就非零，结构化失败回执是可观测性增强，不是异常退出的前提。
+---
 
-从本 Skill 根目录创建仅当前用户可访问的 `.persist-fixture-example`（权限 `0700`）；以 `{}` 初始化其中的状态文件，另放合成输入文件，缓存可尚不存在。三个文件须同目录且互不重名，拒绝符号链接和硬链接。精确接口见脚本 docstring 与 `--help`；只在受控夹具目录中运行，不与其他进程并行替换目录或链接。通过隔离测试只证明给定场景，不证明线上部署或热加载。
+## 4. 显式归档生命周期（`archive` 子命令）
+
+针对超过复核上限或时间窗的 `manual_pending` 条目，仅在获得**用户针对精确链接的明确批准**后，调用：
+
+```bash
+python3 hermes/runtime/reddit_monitor_tick_noagent.py archive --archive-file archive_req.json
+```
+
+`archive_req.json` 示例：
+```json
+{
+  "userApproved": true,
+  "contentRunId": "reddit-20261122T000000Z-a1b2c3d4",
+  "reason": "用户确认归档超期历史人工待办",
+  "targets": [
+    {
+      "permalink": "https://old.reddit.com/r/example/comments/abc123/help/",
+      "expectedSha256": "<可选：当前 seen 条目指纹>"
+    }
+  ]
+}
+```
+
+- **生命周期语义**：写入 `entry.archive = {"status": "archived", "automaticReview": false, "reminders": false, ...}`，保留原 `action`、`reviewStatus` 与 `reviewNotes` 历史证据，不伪装成“问题已解决”。
+- **防误操作保护**：自动拒绝当前轮活跃候选（`cache.candidates`）与已发布保护条目，并在修改前写入不可变 `archive-journal/<journalId>/` 备份与日志。
+
+---
+
+## 5. 隔离持久化模板说明
+
+[scheduled_tick_persist_template.py](../scripts/scheduled_tick_persist_template.py) 仅用于本 Skill 根目录下 `.persist-fixture-*` 隔离目录的离线合成测试，自动拒绝符号链接与生产目录，不可用于线上监控写入。

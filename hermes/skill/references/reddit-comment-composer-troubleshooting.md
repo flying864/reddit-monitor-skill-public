@@ -1,38 +1,41 @@
-# 评论框定位与提交验证
+# Old Reddit 评论框定位与排障手册
 
-适用于已获得本轮发布授权、固定 Camofox 会话中的 Old Reddit 评论框操作。权限和回读标准以主 SKILL 及 [publishing-verification.md](publishing-verification.md) 为准；不要切换身份、浏览器后端或直接调用 Reddit 发布 API。
+适用于已取得本轮明确发布授权后的 Old Reddit 页面表单操作。严禁因选择器歧义切换账号、更换浏览器会话或绕过前端直接调用未注册 API。
 
-## 1. 先确认目标，不靠 ref 序号猜输入框
+## 1. 排除常见 DOM 陷阱（勿按序号盲选输入框）
 
-- 用当前页面 DOM 确认登录账号、帖子 fullname 和现有本账号评论，避免回复到错误帖子或重复提交。
-- 顶层表单从 `.commentarea form.usertext` 选择，要求包含 `textarea[name="text"]`，且 `input[name="thing_id"]` 等于目标 `t3_<post_id>`。嵌套回复使用目标评论的专属表单和 `t1_<comment_id>`，排除后代评论表单。
-- 要求匹配唯一，textarea 非 readonly/disabled，且 `getBoundingClientRect()` 宽高均大于0；排除 shortlink 输入框和隐藏克隆。
-- 普通输入调用失败后，先回读 textarea 当前值、可编辑状态及已发表评论。输入失败本身不是提交失败或服务失效的证据；不要立即重发或切换登录态。
+Old Reddit 帖子页常同时存在多个相似元素：
+- 右侧栏只读短链接框：`input#shortlink-text[readonly]`（对其执行普通输入会触发 `element is not editable`，属元素误选而非浏览器服务崩溃）；
+- 隐藏的回复模板克隆表单（`display: none` 或宽高为 `0`）；
+- 嵌套楼层中子孙评论各自的 `form.usertext`。
 
-## 2. 在同一页面安全填入并回读
+**精确筛选条件**：
+1. 顶层评论：`.commentarea form.usertext`，包含 `input[name="thing_id"][value="t3_<post_id>"]`；
+2. 嵌套回复：目标 `.thing.comment[data-fullname="t1_<comment_id>"]` 直属回复表单，包含 `input[name="thing_id"][value="t1_<comment_id>"]`，排除其子评论容器 `.child` 内的表单；
+3. 目标 `textarea[name="text"]` 必须满足：`!ta.readOnly && !ta.disabled`，且 `ta.getBoundingClientRect().width > 0 && height > 0`，匹配数量精确为 `1`。
 
-优先用最新快照中已确认的输入元素。若 ref 无法可靠定位，但 DOM 已唯一确认表单，可通过同一 Camofox 的 `browser_console` 在该 textarea 内执行：
+## 2. 填入与提交两步分离校验
 
+当快照元素引用存在歧义但 DOM 已唯一锁定目标表单时，可在同一浏览器上下文内分两步执行：
+
+**第一步：仅填入并回读校验（不点击提交）**
 ```js
 ta.focus();
 ta.value = finalText;
 ta.dispatchEvent(new Event('input', { bubbles: true }));
 ta.dispatchEvent(new Event('change', { bubbles: true }));
+return {
+  parentThingId: form.querySelector('input[name="thing_id"]')?.value || null,
+  exactMatch: ta.value === finalText,
+  readbackLength: ta.value.length,
+};
 ```
 
-仅填入本轮确定的最终文本；此步不点击提交。返回完整 `ta.value`、隐藏 Parent 和 `ta.value === finalText`，让填入和提交形成两个独立检查点。Old Reddit 表单若使用 `onsubmit="return post_form(...)"`，确认对应页面处理函数存在；函数缺失时不能把按钮点击当作成功。
+**第二步：核对无误后单次点击专属提交按钮**
+- 确认 `exactMatch === true`、`parentThingId` 正确、当前页面不存在本账号同内容已发评论；
+- 若表单含 `onsubmit="return post_form(...)"`，确认全局处理函数已加载；
+- 精确点击该 `form` 内部的 `button.save[type="submit"]` 一次（切勿使用全页文本匹配 `"save"`，以免误点帖子收藏链接 `a.save-button`）。
 
-## 3. 只提交一次
+## 3. 提交后精确验证
 
-提交调用中再次检查账号、唯一目标表单、Parent、全文逐字一致、可用的 `button.save[type="submit"]`，并确认没有本账号的同内容评论，然后仅点击该表单按钮一次。不要用页面级“save”文本选择器，因为保存帖子/评论链接也可能同名。
-
-## 4. 通过精确评论链接验证
-
-- 提交后先读取新评论的作者、全文、Comment ID 和 permalink；这些信息用于找到验证目标，不单独构成完成。
-- Fresh navigate 到返回的精确评论 permalink，再核对作者、完整正文和所属帖子。顶层评论应没有祖先 `.thing.comment`；嵌套评论必须确认直接 Parent，不能仅用任意祖先 contains 证明。
-- 编辑框仍有文字、隐藏编辑副本或过期的“暂无评论”提示均不证明未发送；先核对精确链接，避免二次提交造成重复。
-- 没有可验证评论时，检查可见错误/限流和当前页面状态；结果未知则停止提交并报告，不盲重试。只有确认未发送后才能在原授权内有界重试。
-
-## 5. 分开处理发布与本地记录
-
-发布经 fresh reload 验证后，按 [state-persistence.md](state-persistence.md) 保存独立回执并更新去重状态。本地落库失败不把真实评论降格为“未发”，也不重新发布；只报告本地记录未完成。最后仅关闭本任务创建的临时标签。
+按 [publishing-verification.md](publishing-verification.md) Fresh Navigate 至新评论 Permalink 验证作者、全文、ID 与直接父节点；验证未决时禁止二次点击提交。
